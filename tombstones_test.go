@@ -118,6 +118,38 @@ func TestAddingNewIntervals(t *testing.T) {
 			new:   Interval{11, 14},
 			exp:   Intervals{{5, 20}, {25, 30}},
 		},
+		{
+			// New interval fully contains an existing one. The result must
+			// stay sorted and non-overlapping, otherwise deletion filtering
+			// and chunk re-encoding silently miss samples.
+			exist: Intervals{{100, 200}},
+			new:   Interval{50, 250},
+			exp:   Intervals{{50, 250}},
+		},
+		{
+			// New interval fully contains several existing ones.
+			exist: Intervals{{10, 20}, {30, 40}, {60, 70}},
+			new:   Interval{5, 80},
+			exp:   Intervals{{5, 80}},
+		},
+		{
+			// New interval starts before and ends inside the first existing one.
+			exist: Intervals{{10, 20}, {30, 40}},
+			new:   Interval{5, 15},
+			exp:   Intervals{{5, 20}, {30, 40}},
+		},
+		{
+			// New interval starts inside and extends past the last existing one.
+			exist: Intervals{{10, 20}, {30, 40}},
+			new:   Interval{35, 50},
+			exp:   Intervals{{10, 20}, {30, 50}},
+		},
+		{
+			// Adjacent intervals must be merged into a single closed range.
+			exist: Intervals{{10, 20}, {30, 40}},
+			new:   Interval{21, 29},
+			exp:   Intervals{{10, 40}},
+		},
 	}
 
 	for _, c := range cases {

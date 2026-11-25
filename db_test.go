@@ -22,6 +22,8 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2358,4 +2360,111 @@ func TestDBReadOnlyClosing(t *testing.T) {
 	testutil.Equals(t, err, ErrClosed)
 	_, err = db.Querier(0, 1)
 	testutil.Equals(t, err, ErrClosed)
+}
+
+// TestDBConcurrentDeleteAndQuery verifies requirement 5: batched deletes and
+// queries running concurrently must never expose a corrupted view. Every query
+// observes a consistent snapshot: timestamps stay within the queried range,
+// strictly increasing (no duplicates), and after all deletions finish no
+// deleted sample is visible. Run it with -race to exercise the locking around
+// tombstones and blocks as well.
+func TestDBConcurrentDeleteAndQuery(t *testing.T) {
+	db, cleanup := openTestDB(t, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+		cleanup()
+	}()
+	// Head compaction would interleave with the deletion workload and is not the
+	// subject of this test; keep all data in the head.
+	db.DisableCompactions()
+
+	lset := labels.Labels{{Name: "a", Value: "b"}}
+	matcher := labels.NewEqualMatcher("a", "b")
+	const totalSamples int64 = 100
+
+	app := db.Appender()
+	for i := int64(0); i < totalSamples; i++ {
+		_, err := app.Add(lset, i, float64(i))
+		testutil.Ok(t, err)
+	}
+	testutil.Ok(t, app.Commit())
+
+	var (
+		wg       sync.WaitGroup
+		firstErr atomic.Value
+	)
+	fail := func(err error) {
+		if err != nil {
+			firstErr.CompareAndSwap(nil, err)
+		}
+	}
+
+	// Deleter: cover the full range through adjacent, separately recorded
+	// deletion batches.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for start := int64(0); start < totalSamples && firstErr.Load() == nil; {
+			end := start + 4
+			if end >= totalSamples {
+				end = totalSamples - 1
+			}
+			fail(db.Delete(start, end, matcher))
+			start = end + 1
+		}
+	}()
+
+	// Readers: run a bounded number of queries and validate the per-series
+	// invariants while deletions are in flight.
+	for r := 0; r < 3; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50 && firstErr.Load() == nil; i++ {
+				q, err := db.Querier(0, totalSamples)
+				if err != nil {
+					fail(err)
+					return
+				}
+				ss, err := q.Select(matcher)
+				if err != nil {
+					fail(err)
+					fail(q.Close())
+					return
+				}
+				for ss.Next() {
+					var lastT int64 = math.MinInt64
+					it := ss.At().Iterator()
+					for it.Next() {
+						ts, _ := it.At()
+						if ts < 0 || ts >= totalSamples {
+							fail(fmt.Errorf("sample out of query range: %d", ts))
+						}
+						if ts <= lastT {
+							fail(fmt.Errorf("non-increasing or duplicate timestamp: %d after %d", ts, lastT))
+						}
+						lastT = ts
+					}
+					fail(it.Err())
+				}
+				fail(ss.Err())
+				fail(q.Close())
+			}
+		}()
+	}
+
+	wg.Wait()
+	if v := firstErr.Load(); v != nil {
+		testutil.Ok(t, v.(error))
+	}
+
+	// Final invariant: every deleted sample is gone without duplicates.
+	q, err := db.Querier(0, totalSamples)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, q.Close()) }()
+
+	ss, err := q.Select(matcher)
+	testutil.Ok(t, err)
+	testutil.Assert(t, !ss.Next(), "the fully deleted series must not be returned")
+	testutil.Ok(t, ss.Err())
 }

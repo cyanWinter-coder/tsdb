@@ -257,48 +257,32 @@ func (tr Interval) isSubrange(dranges Intervals) bool {
 type Intervals []Interval
 
 // add the new time-range to the existing ones.
-// The existing ones must be sorted.
+// The existing ones must be sorted, increasing and non-overlapping. The result
+// preserves the same invariant: adjacent intervals (touching at one timestamp
+// apart) are merged as well since tombstones use closed intervals.
 func (itvs Intervals) add(n Interval) Intervals {
-	for i, r := range itvs {
-		// TODO(gouthamve): Make this codepath easier to digest.
-		if r.inBounds(n.Mint-1) || r.inBounds(n.Mint) {
-			if n.Maxt > r.Maxt {
-				itvs[i].Maxt = n.Maxt
-			}
+	res := make(Intervals, 0, len(itvs)+1)
 
-			j := 0
-			for _, r2 := range itvs[i+1:] {
-				if n.Maxt < r2.Mint {
-					break
-				}
-				j++
-			}
-			if j != 0 {
-				if itvs[i+j].Maxt > n.Maxt {
-					itvs[i].Maxt = itvs[i+j].Maxt
-				}
-				itvs = append(itvs[:i+1], itvs[i+j+1:]...)
-			}
-			return itvs
-		}
-
-		if r.inBounds(n.Maxt+1) || r.inBounds(n.Maxt) {
-			if n.Mint < r.Maxt {
-				itvs[i].Mint = n.Mint
-			}
-			return itvs
-		}
-
-		if n.Mint < r.Mint {
-			newRange := make(Intervals, i, len(itvs[:i])+1)
-			copy(newRange, itvs[:i])
-			newRange = append(newRange, n)
-			newRange = append(newRange, itvs[i:]...)
-
-			return newRange
-		}
+	i := 0
+	// Copy over every interval that ends strictly before the new range starts.
+	for i < len(itvs) && itvs[i].Maxt+1 < n.Mint {
+		res = append(res, itvs[i])
+		i++
 	}
 
-	itvs = append(itvs, n)
-	return itvs
+	// Everything overlapping with or adjacent to the new range collapses into
+	// a single interval covering both ends.
+	for i < len(itvs) && itvs[i].Mint <= n.Maxt+1 {
+		if itvs[i].Mint < n.Mint {
+			n.Mint = itvs[i].Mint
+		}
+		if itvs[i].Maxt > n.Maxt {
+			n.Maxt = itvs[i].Maxt
+		}
+		i++
+	}
+	res = append(res, n)
+
+	// Append the untouched suffix.
+	return append(res, itvs[i:]...)
 }

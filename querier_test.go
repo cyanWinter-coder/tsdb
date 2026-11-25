@@ -1044,6 +1044,127 @@ func TestSeriesIterator(t *testing.T) {
 	})
 }
 
+// TestChainedSeriesIteratorDedup makes sure the chained iterator, which merges
+// the same series across sequential blocks, never returns the same timestamp
+// twice. This can happen when block time ranges briefly overlap (e.g. a block
+// rewrite racing with ingestion) and previously produced duplicate samples.
+func TestChainedSeriesIteratorDedup(t *testing.T) {
+	cases := []struct {
+		name       string
+		a, b, c    []tsdbutil.Sample
+		exp        []tsdbutil.Sample
+		mint, maxt int64
+		seek       int64
+		seekOK     bool
+	}{
+		{
+			name: "duplicate at block boundary, first value wins",
+			a:    []tsdbutil.Sample{sample{1, 1}, sample{2, 2}, sample{3, 3}},
+			b:    []tsdbutil.Sample{sample{3, 30}, sample{4, 4}},
+			c:    []tsdbutil.Sample{sample{4, 40}, sample{5, 5}},
+			exp: []tsdbutil.Sample{
+				sample{1, 1}, sample{2, 2}, sample{3, 3}, sample{4, 4}, sample{5, 5},
+			},
+			mint: math.MinInt64,
+			maxt: math.MaxInt64,
+			seek: 3,
+			seekOK: true,
+		},
+		{
+			name: "fully overlapping blocks collapse to one sample per timestamp",
+			a:    []tsdbutil.Sample{sample{1, 1}, sample{2, 2}},
+			b:    []tsdbutil.Sample{sample{1, 10}, sample{2, 20}, sample{3, 3}},
+			c:    []tsdbutil.Sample{},
+			exp: []tsdbutil.Sample{
+				sample{1, 1}, sample{2, 2}, sample{3, 3},
+			},
+			mint: math.MinInt64,
+			maxt: math.MaxInt64,
+			seek: 2,
+			seekOK: true,
+		},
+		{
+			name: "duplicates at both block boundaries",
+			a:    []tsdbutil.Sample{sample{1, 1}, sample{2, 2}},
+			b:    []tsdbutil.Sample{sample{2, 20}, sample{5, 5}, sample{9, 9}},
+			c:    []tsdbutil.Sample{sample{9, 90}, sample{10, 10}},
+			exp: []tsdbutil.Sample{
+				sample{1, 1}, sample{2, 2}, sample{5, 5}, sample{9, 9}, sample{10, 10},
+			},
+			mint:   math.MinInt64,
+			maxt:   math.MaxInt64,
+			seek:   9,
+			seekOK: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b, c := itSeries{newListSeriesIterator(tc.a)},
+				itSeries{newListSeriesIterator(tc.b)},
+				itSeries{newListSeriesIterator(tc.c)}
+
+			res := newChainedSeriesIterator(a, b, c)
+			// The chained iterator itself is range-agnostic; mint/maxt are applied
+			// by the wrapping chunk series iterator. Here we assert dedup on the
+			// raw sequence and, separately, the Seek contract.
+			got, err := expandSeriesIterator(res)
+			testutil.Ok(t, err)
+			testutil.Equals(t, tc.exp, got)
+
+			// Re-create for Seek since the previous run consumed the iterator.
+			res = newChainedSeriesIterator(
+				itSeries{newListSeriesIterator(tc.a)},
+				itSeries{newListSeriesIterator(tc.b)},
+				itSeries{newListSeriesIterator(tc.c)},
+			)
+			testutil.Equals(t, tc.seekOK, res.Seek(tc.seek))
+			if tc.seekOK {
+				ts, _ := res.At()
+				testutil.Assert(t, ts >= tc.seek, "seek landed before requested timestamp")
+			}
+		})
+	}
+}
+
+// TestChainedSeriesIteratorSeekSkipsServedBlocks ensures a seek still finds a
+// sample that only exists in a later block after all earlier blocks have been
+// consumed, even when the seek target is behind the last returned timestamp's
+// block. The iterator must skip fully-consumed sub-iterators instead of
+// returning false prematurely.
+func TestChainedSeriesIteratorSeekSkipsServedBlocks(t *testing.T) {
+	a := itSeries{newListSeriesIterator([]tsdbutil.Sample{sample{1, 1}, sample{2, 2}})}
+	b := itSeries{newListSeriesIterator([]tsdbutil.Sample{sample{2, 20}, sample{3, 3}})}
+	c := itSeries{newListSeriesIterator([]tsdbutil.Sample{sample{8, 8}, sample{9, 9}})}
+
+	it := newChainedSeriesIterator(a, b, c)
+
+	// Drain through the first two blocks so lastT reaches 3.
+	var drained []tsdbutil.Sample
+	for it.Next() {
+		ts, v := it.At()
+		drained = append(drained, sample{ts, v})
+		if ts >= 3 {
+			break
+		}
+	}
+	testutil.Equals(t, []tsdbutil.Sample{
+		sample{1, 1}, sample{2, 2}, sample{3, 3},
+	}, drained)
+
+	// Seek into the third block. The duplicate t=2 in b must not resurface and
+	// the iterator must continue into c rather than stopping.
+	testutil.Assert(t, it.Seek(8), "seek into a later block must succeed")
+	ts, v := it.At()
+	testutil.Equals(t, int64(8), ts)
+	testutil.Equals(t, float64(8), v)
+
+	testutil.Assert(t, it.Next(), "iterator must continue after the seeked sample")
+	ts, _ = it.At()
+	testutil.Equals(t, int64(9), ts)
+	testutil.Assert(t, !it.Next(), "iterator must be exhausted after the last sample")
+}
+
 // Regression for: https://github.com/prometheus/tsdb/pull/97
 func TestChunkSeriesIterator_DoubleSeek(t *testing.T) {
 	chkMetas := []chunks.Meta{

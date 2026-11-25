@@ -502,6 +502,20 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	return uid, nil
 }
 
+// SetDeletable marks the given block's meta as deletable. It is used when a
+// block rewrite (e.g. tombstone cleanup) produces an empty block, so the source
+// block is removed on the next reload instead of lingering with its deleted
+// data still readable.
+func (c *LeveledCompactor) SetDeletable(b *Block) error {
+	b.meta.Compaction.Deletable = true
+	n, err := writeMetaFile(c.logger, b.dir, &b.meta)
+	if err != nil {
+		return err
+	}
+	b.numBytesMeta = n
+	return nil
+}
+
 // instrumentedChunkWriter is used for level 1 compactions to record statistics
 // about compacted chunks.
 type instrumentedChunkWriter struct {

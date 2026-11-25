@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/kit/log"
+	"github.com/oklog/ulid"
 	"github.com/prometheus/tsdb/chunks"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
@@ -292,4 +293,303 @@ func populateSeries(lbls []map[string]string, mint, maxt int64) []Series {
 		series = append(series, newSeries(lbl, samples))
 	}
 	return series
+}
+
+// queryBlockSamples runs a query against a block for all series matching the
+// given matchers and returns every returned sample grouped by label set.
+func queryBlockSamples(t *testing.T, b BlockReader, mint, maxt int64, ms ...labels.Matcher) map[string][]tsdbutil.Sample {
+	t.Helper()
+
+	q, err := NewBlockQuerier(b, mint, maxt)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, q.Close()) }()
+
+	ss, err := q.Select(ms...)
+	testutil.Ok(t, err)
+
+	res := make(map[string][]tsdbutil.Sample)
+	for ss.Next() {
+		s := ss.At()
+		samples, err := expandSeriesIterator(s.Iterator())
+		testutil.Ok(t, err)
+		res[s.Labels().String()] = samples
+	}
+	testutil.Ok(t, ss.Err())
+	return res
+}
+
+// TestBlockDeleteBatchedFiltersAtQuery verifies requirement 1 and 4: deletes
+// recorded by time interval uniformly filter query results, even when the
+// deletion arrives in adjacent batches and the query range is narrower than
+// the block range. Out-of-range queries must not return deleted data.
+func TestBlockDeleteBatchedFiltersAtQuery(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpdir)) }()
+
+	const (
+		mint int64 = 0
+		maxt int64 = 20
+	)
+	blockDir := createBlock(t, tmpdir, genSeries(2, 1, mint, maxt))
+	b, err := OpenBlock(nil, blockDir, nil)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, b.Close()) }()
+
+	matchAll := labels.NewMustRegexpMatcher("", ".*")
+
+	// Sanity check: all samples are visible before deletion.
+	got := queryBlockSamples(t, b, mint, maxt, matchAll)
+	testutil.Equals(t, 2, len(got))
+	for _, smpls := range got {
+		testutil.Equals(t, int(maxt-mint), len(smpls))
+	}
+
+	// Two adjacent, separately recorded deletions together cover the whole
+	// range of series 0. They must merge into one tombstone range and filter
+	// every single sample.
+	testutil.Ok(t, b.Delete(0, 9, labels.NewEqualMatcher(defaultLabelName, "0")))
+	testutil.Ok(t, b.Delete(10, 19, labels.NewEqualMatcher(defaultLabelName, "0")))
+
+	// Series 0 must now be entirely hidden, while series 1 is untouched.
+	got = queryBlockSamples(t, b, mint, maxt, matchAll)
+	testutil.Equals(t, 1, len(got))
+	for lset, smpls := range got {
+		testutil.Equals(t, labels.Labels{{Name: defaultLabelName, Value: "1"}}.String(), lset)
+		testutil.Equals(t, int(maxt-mint), len(smpls))
+	}
+
+	// A query scoped to the deleted range must return no series at all, and a
+	// narrow sub-range inside the tombstone must be empty as well.
+	testutil.Equals(t, 0, len(queryBlockSamples(t, b, 0, 19, labels.NewEqualMatcher(defaultLabelName, "0"))))
+	testutil.Equals(t, 0, len(queryBlockSamples(t, b, 3, 7, labels.NewEqualMatcher(defaultLabelName, "0"))))
+}
+
+// TestBlockCleanTombstonesDropsFullyDeletedBlock verifies requirement 3: when
+// every sample in a block is deleted, rewriting it yields an empty block and
+// the source block is marked deletable, so the deleted data cannot reappear by
+// a later reload reading the source block's tombstoned samples.
+func TestBlockCleanTombstonesDropsFullyDeletedBlock(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpdir)) }()
+
+	compactor, err := NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
+	testutil.Ok(t, err)
+
+	const (
+		mint int64 = 0
+		maxt int64 = 20
+	)
+	blockDir := createBlock(t, tmpdir, genSeries(1, 1, mint, maxt))
+	b, err := OpenBlock(nil, blockDir, nil)
+	testutil.Ok(t, err)
+
+	matchAll := labels.NewMustRegexpMatcher("", ".*")
+
+	// Delete the whole block in two adjacent batches.
+	testutil.Ok(t, b.Delete(0, 9, matchAll))
+	testutil.Ok(t, b.Delete(10, 19, matchAll))
+
+	// Querying before cleanup already returns nothing.
+	testutil.Equals(t, 0, len(queryBlockSamples(t, b, mint, maxt, matchAll)))
+
+	uid, err := b.CleanTombstones(tmpdir, compactor)
+	testutil.Ok(t, err)
+	testutil.Assert(t, uid == nil, "rewrite of a fully deleted block must not create a block, got %v", uid)
+	testutil.Assert(t, b.Meta().Compaction.Deletable,
+		"source block of an empty rewrite must be marked deletable")
+	testutil.Ok(t, b.Close())
+
+	// No replacement block directory may exist next to the (now deletable)
+	// source block.
+	dirs, err := blockDirs(tmpdir)
+	testutil.Ok(t, err)
+	testutil.Equals(t, []string{blockDir}, dirs)
+}
+
+// TestBlockDeletePartialSurvivesCompaction makes sure partial deletions are
+// preserved through a block rewrite: deleted samples never reappear and the
+// remaining samples keep their exact timestamps and values.
+func TestBlockDeletePartialSurvivesCompaction(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpdir)) }()
+
+	compactor, err := NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
+	testutil.Ok(t, err)
+
+	const (
+		mint int64 = 0
+		maxt int64 = 20
+	)
+	blockDir := createBlock(t, tmpdir, genSeries(1, 1, mint, maxt))
+	b, err := OpenBlock(nil, blockDir, nil)
+	testutil.Ok(t, err)
+
+	matchAll := labels.NewMustRegexpMatcher("", ".*")
+
+	before := queryBlockSamples(t, b, mint, maxt, matchAll)
+	var lset string
+	var original []tsdbutil.Sample
+	for k, v := range before {
+		lset, original = k, v
+	}
+
+	// Delete the middle, in two non-adjacent batches.
+	testutil.Ok(t, b.Delete(5, 9, matchAll))
+	testutil.Ok(t, b.Delete(12, 15, matchAll))
+
+	uid, err := b.CleanTombstones(tmpdir, compactor)
+	testutil.Ok(t, err)
+	testutil.Assert(t, uid != nil, "expected a replacement block for partial deletion")
+	testutil.Ok(t, b.Close())
+
+	rewritten, err := OpenBlock(nil, filepath.Join(tmpdir, uid.String()), nil)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, rewritten.Close()) }()
+
+	after := queryBlockSamples(t, rewritten, mint, maxt, matchAll)
+	smpls, ok := after[lset]
+	testutil.Assert(t, ok, "series disappeared after partial compaction")
+
+	want := make([]tsdbutil.Sample, 0, len(original))
+	for _, s := range original {
+		ts := s.T()
+		if (ts >= 5 && ts <= 9) || (ts >= 12 && ts <= 15) {
+			continue
+		}
+		want = append(want, s)
+	}
+	testutil.Equals(t, want, smpls)
+}
+
+// TestCompactMergesTombstonesAcrossBlocks verifies requirement 2 and 3 on the
+// multi-block compaction path: when the same series carries tombstones in
+// several source blocks (including a new interval that fully contains an older
+// one), the merged block physically drops every deleted sample and keeps the
+// rest. If all samples disappear, no block is written and the sources are
+// marked deletable.
+func TestCompactMergesTombstonesAcrossBlocks(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpdir)) }()
+
+	compactor, err := NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
+	testutil.Ok(t, err)
+
+	matchAll := labels.NewMustRegexpMatcher("", ".*")
+
+	// Two sequential blocks, each holding one series with samples [0,20) and
+	// [20,40). They share the same label set so compaction merges them into
+	// one series.
+	dir1 := createBlock(t, tmpdir, genSeries(1, 1, 0, 20))
+	block1, err := OpenBlock(nil, dir1, nil)
+	testutil.Ok(t, err)
+
+	secondDir := filepath.Join(tmpdir, "second")
+	testutil.Ok(t, os.MkdirAll(secondDir, 0777))
+	dir2 := createBlock(t, secondDir, genSeries(1, 1, 20, 40))
+	block2, err := OpenBlock(nil, dir2, nil)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, block1.Close())
+	testutil.Ok(t, block2.Close())
+
+	// Re-open and record deletes in separate batches. Block 1 gets a narrow
+	// delete first, then a containing delete; block 2 deletes an adjacent range.
+	block1, err = OpenBlock(nil, dir1, nil)
+	testutil.Ok(t, err)
+	block2, err = OpenBlock(nil, dir2, nil)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, block1.Delete(5, 8, matchAll))
+	testutil.Ok(t, block1.Delete(3, 12, matchAll)) // contains [5,8]
+	testutil.Ok(t, block2.Delete(25, 30, matchAll))
+
+	sourceUIDs := []ulid.ULID{block1.Meta().ULID, block2.Meta().ULID}
+	testutil.Ok(t, block1.Close())
+	testutil.Ok(t, block2.Close())
+
+	uid, err := compactor.Compact(tmpdir, []string{dir1, dir2}, nil)
+	testutil.Ok(t, err)
+	testutil.Assert(t, uid != (ulid.ULID{}), "expected a merged block since not all samples were deleted")
+
+	merged, err := OpenBlock(nil, filepath.Join(tmpdir, uid.String()), nil)
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, merged.Close()) }()
+
+	got := queryBlockSamples(t, merged, 0, 40, matchAll)
+	testutil.Equals(t, 1, len(got))
+	var smpls []tsdbutil.Sample
+	for _, v := range got {
+		smpls = v
+	}
+
+	deleted := func(ts int64) bool {
+		return (ts >= 3 && ts <= 12) || (ts >= 25 && ts <= 30)
+	}
+	var expectedTs []int64
+	for ts := int64(0); ts < 40; ts++ {
+		if !deleted(ts) {
+			expectedTs = append(expectedTs, ts)
+		}
+	}
+	testutil.Equals(t, len(expectedTs), len(smpls))
+	for i, s := range smpls {
+		testutil.Equals(t, expectedTs[i], s.T())
+	}
+
+	// The merged block must not carry tombstones anymore: the deletions were
+	// materialised into the rewritten chunks.
+	tr, _, err := readTombstones(merged.Dir())
+	testutil.Ok(t, err)
+	testutil.Equals(t, uint64(0), tr.Total())
+
+	// For a non-empty merge the source blocks are reclaimed through the new
+	// block's parent references on the next DB.reload() (DB.deletableBlocks),
+	// not through the Deletable flag, which is reserved for empty rewrites.
+	parentSet := map[ulid.ULID]bool{}
+	for _, p := range merged.Meta().Compaction.Parents {
+		parentSet[p.ULID] = true
+	}
+	for _, id := range sourceUIDs {
+		testutil.Assert(t, parentSet[id], "merged block does not reference source block %s", id)
+	}
+}
+
+// TestCompactFullyDeletedBlocksDropsThem covers requirement 3 for the
+// multi-block path: compacting blocks whose union is entirely deleted writes
+// nothing and marks every source block deletable.
+func TestCompactFullyDeletedBlocksDropsThem(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(tmpdir)) }()
+
+	compactor, err := NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
+	testutil.Ok(t, err)
+
+	matchAll := labels.NewMustRegexpMatcher("", ".*")
+
+	dir1 := createBlock(t, tmpdir, genSeries(1, 1, 0, 20))
+	secondDir := filepath.Join(tmpdir, "second")
+	testutil.Ok(t, os.MkdirAll(secondDir, 0777))
+	dir2 := createBlock(t, secondDir, genSeries(1, 1, 20, 40))
+
+	for _, d := range []string{dir1, dir2} {
+		b, err := OpenBlock(nil, d, nil)
+		testutil.Ok(t, err)
+		testutil.Ok(t, b.Delete(0, 40, matchAll))
+		testutil.Ok(t, b.Close())
+	}
+
+	uid, err := compactor.Compact(tmpdir, []string{dir1, dir2}, nil)
+	testutil.Ok(t, err)
+	testutil.Equals(t, ulid.ULID{}, uid)
+
+	for _, d := range []string{dir1, dir2} {
+		meta, _, err := readMetaFile(d)
+		testutil.Ok(t, err)
+		testutil.Assert(t, meta.Compaction.Deletable, "fully deleted source block not marked deletable: %s", d)
+	}
 }

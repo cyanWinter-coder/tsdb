@@ -571,6 +571,9 @@ Outer:
 
 // CleanTombstones will remove the tombstones and rewrite the block (only if there are any tombstones).
 // If there was a rewrite, then it returns the ULID of the new block written, else nil.
+// If the rewrite produces an empty block (all samples were tombstoned), no new
+// block is written and the source block is marked Deletable so it gets removed on
+// the next reload; otherwise its deleted data would remain readable forever.
 func (pb *Block) CleanTombstones(dest string, c Compactor) (*ulid.ULID, error) {
 	numStones := 0
 
@@ -589,6 +592,17 @@ func (pb *Block) CleanTombstones(dest string, c Compactor) (*ulid.ULID, error) {
 	uid, err := c.Write(dest, pb, pb.meta.MinTime, pb.meta.MaxTime, &meta)
 	if err != nil {
 		return nil, err
+	}
+
+	// An empty ULID means the rewritten block holds no samples anymore. Mark the
+	// source block deletable rather than leaving both around.
+	if uid == (ulid.ULID{}) {
+		if lc, ok := c.(*LeveledCompactor); ok {
+			if err := lc.SetDeletable(pb); err != nil {
+				return nil, errors.Wrap(err, "mark fully deleted block deletable")
+			}
+		}
+		return nil, nil
 	}
 	return &uid, nil
 }

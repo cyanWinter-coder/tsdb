@@ -1,5 +1,9 @@
 ## master / unreleased
 
+ - [BUGFIX] `Intervals.add` now always produces sorted, non-overlapping tombstone ranges, including when a new deletion interval fully contains existing ones. Previously the violated invariant caused interval filtering and chunk re-encoding to miss deleted samples.
+ - [BUGFIX] `chainedSeriesIterator` now deduplicates samples sharing a timestamp at block boundaries so the same series returned from overlapping blocks is not duplicated, and `Seek` no longer stops at a fully consumed block.
+ - [BUGFIX] `Block.CleanTombstones` marks the source block `Deletable` when its rewrite yields an empty block, so a fully deleted block is dropped on reload instead of leaving the deleted data readable.
+
 ## 0.10.0
 
  - [FEATURE] Added `DBReadOnly` to allow opening a database in read only mode.

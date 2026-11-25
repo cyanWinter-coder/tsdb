@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -904,13 +905,21 @@ func (s *chainedSeries) Iterator() SeriesIterator {
 	return newChainedSeriesIterator(s.series...)
 }
 
-// chainedSeriesIterator implements a series iterater over a list
-// of time-sorted, non-overlapping iterators.
+// chainedSeriesIterator implements a series iterator over a list
+// of time-sorted, non-overlapping iterators. Block ranges are expected to be
+// sequential, yet brief overlaps can occur (e.g. a block being rewritten while
+// ingestion continues), so timestamps seen at a block boundary are deduplicated
+// and the value of the first (earlier) block wins.
 type chainedSeriesIterator struct {
 	series []Series // series in time order
 
 	i   int
 	cur SeriesIterator
+
+	// lastT tracks the timestamp of the last sample returned across all
+	// chained iterators. A sample from a subsequent block with the same
+	// timestamp is a duplicate and must be skipped.
+	lastT int64
 }
 
 func newChainedSeriesIterator(s ...Series) *chainedSeriesIterator {
@@ -918,6 +927,7 @@ func newChainedSeriesIterator(s ...Series) *chainedSeriesIterator {
 		series: s,
 		i:      0,
 		cur:    s[0].Iterator(),
+		lastT:  math.MinInt64,
 	}
 }
 
@@ -931,26 +941,45 @@ func (it *chainedSeriesIterator) Seek(t int64) bool {
 		}
 		it.cur = cur
 		it.i += i
-		return true
+
+		// Advance past samples already returned by earlier blocks so a seek
+		// never exposes a duplicate and never moves the view backwards. If this
+		// sub-iterator is fully behind, fall through to the next one.
+		for {
+			ts, _ := cur.At()
+			if ts > it.lastT {
+				it.lastT = ts
+				return true
+			}
+			if !cur.Next() {
+				break
+			}
+		}
 	}
 	return false
 }
 
 func (it *chainedSeriesIterator) Next() bool {
-	if it.cur.Next() {
-		return true
-	}
-	if err := it.cur.Err(); err != nil {
-		return false
-	}
-	if it.i == len(it.series)-1 {
-		return false
+	if !it.cur.Next() {
+		if err := it.cur.Err(); err != nil {
+			return false
+		}
+		if it.i == len(it.series)-1 {
+			return false
+		}
+
+		it.i++
+		it.cur = it.series[it.i].Iterator()
+		return it.Next()
 	}
 
-	it.i++
-	it.cur = it.series[it.i].Iterator()
+	// Skip samples whose timestamp was already returned by an earlier block.
+	if ts, _ := it.cur.At(); ts <= it.lastT {
+		return it.Next()
+	}
 
-	return it.Next()
+	it.lastT, _ = it.cur.At()
+	return true
 }
 
 func (it *chainedSeriesIterator) At() (t int64, v float64) {
