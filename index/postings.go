@@ -16,6 +16,7 @@ package index
 import (
 	"container/heap"
 	"encoding/binary"
+	"errors"
 	"runtime"
 	"sort"
 	"strings"
@@ -23,6 +24,13 @@ import (
 
 	"github.com/prometheus/tsdb/labels"
 )
+
+// ErrClosed is returned when a read is attempted after the in-memory postings
+// index has been closed.
+var ErrClosed = errors.New("index already closed")
+
+// ErrIndexClosed is an alias for callers that prefer the more explicit name.
+var ErrIndexClosed = ErrClosed
 
 var allPostingsKey = labels.Label{}
 
@@ -39,6 +47,7 @@ type MemPostings struct {
 	mtx     sync.RWMutex
 	m       map[string]map[string][]uint64
 	ordered bool
+	closed  bool
 }
 
 // NewMemPostings returns a memPostings that's ready for reads and writes.
@@ -80,24 +89,69 @@ func (p *MemPostings) SortedKeys() []labels.Label {
 }
 
 // Get returns a postings list for the given label pair.
+//
+// The returned iterator owns an immutable snapshot of the IDs that were
+// present when Get was called. Copying the slice while holding the read lock
+// prevents concurrent appends and deletes from mutating the backing array
+// while a query is iterating over it.
 func (p *MemPostings) Get(name, value string) Postings {
-	var lp []uint64
 	p.mtx.RLock()
-	l := p.m[name]
-	if l != nil {
-		lp = l[value]
+	if p.closed {
+		p.mtx.RUnlock()
+		return ErrPostings(ErrClosed)
+	}
+	var ids []uint64
+	if l := p.m[name]; l != nil {
+		if lp := l[value]; len(lp) > 0 {
+			ids = make([]uint64, len(lp))
+			copy(ids, lp)
+		}
 	}
 	p.mtx.RUnlock()
 
-	if lp == nil {
+	if len(ids) == 0 {
 		return EmptyPostings()
 	}
-	return newListPostings(lp...)
+	return newListPostings(ids...)
 }
 
 // All returns a postings list over all documents ever added.
 func (p *MemPostings) All() Postings {
 	return p.Get(AllPostingsKey())
+}
+
+// Size returns an approximate number of bytes retained by the postings maps.
+// It is intended for memory-pressure decisions, not exact accounting.
+func (p *MemPostings) Size() int64 {
+	p.mtx.RLock()
+	defer p.mtx.RUnlock()
+
+	var size int64
+	for name, values := range p.m {
+		size += int64(len(name)) + 64 // string/header and map overhead estimate
+		for value, ids := range values {
+			size += int64(len(value))
+			size += int64(cap(ids)) * 8
+			size += 48 // per-value map/slice overhead estimate
+		}
+	}
+	return size
+}
+
+// Close releases the postings maps. It is safe to call more than once.
+//
+// Already-returned posting iterators own independent slices and remain valid;
+// subsequent Get calls return ErrClosed.
+func (p *MemPostings) Close() error {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	p.m = nil
+	return nil
 }
 
 // EnsureOrder ensures that all postings lists are sorted. After it returns all further
@@ -133,6 +187,26 @@ func (p *MemPostings) EnsureOrder() {
 	close(workc)
 	wg.Wait()
 
+	// WAL replay or a raced/redundant insertion can leave repeated IDs in a
+	// list. Sorting has made them adjacent; compact them in place.
+	for _, e := range p.m {
+		for v, l := range e {
+			if len(l) < 2 {
+				continue
+			}
+			w := 1
+			for r := 1; r < len(l); r++ {
+				if l[r] != l[w-1] {
+					l[w] = l[r]
+					w++
+				}
+			}
+			if w < len(l) {
+				e[v] = l[:w]
+			}
+		}
+	}
+
 	p.ordered = true
 }
 
@@ -140,9 +214,13 @@ func (p *MemPostings) EnsureOrder() {
 func (p *MemPostings) Delete(deleted map[uint64]struct{}) {
 	var keys, vals []string
 
+	p.mtx.RLock()
+	if p.closed {
+		p.mtx.RUnlock()
+		return
+	}
 	// Collect all keys relevant for deletion once. New keys added afterwards
 	// can by definition not be affected by any of the given deletes.
-	p.mtx.RLock()
 	for n := range p.m {
 		keys = append(keys, n)
 	}
@@ -213,13 +291,19 @@ func (p *MemPostings) Iter(f func(labels.Label, Postings) error) error {
 // Add a label set to the postings index.
 func (p *MemPostings) Add(id uint64, lset labels.Labels) {
 	p.mtx.Lock()
+	defer p.mtx.Unlock()
+
+	if p.closed {
+		return
+	}
+	if p.m == nil {
+		p.m = make(map[string]map[string][]uint64, 512)
+	}
 
 	for _, l := range lset {
 		p.addFor(id, l)
 	}
 	p.addFor(id, allPostingsKey)
-
-	p.mtx.Unlock()
 }
 
 func (p *MemPostings) addFor(id uint64, l labels.Label) {
@@ -228,7 +312,13 @@ func (p *MemPostings) addFor(id uint64, l labels.Label) {
 		nm = map[string][]uint64{}
 		p.m[l.Name] = nm
 	}
-	list := append(nm[l.Value], id)
+	existing := nm[l.Value]
+	if p.ordered {
+		if i := sort.Search(len(existing), func(i int) bool { return existing[i] >= id }); i < len(existing) && existing[i] == id {
+			return
+		}
+	}
+	list := append(existing, id)
 	nm[l.Value] = list
 
 	if !p.ordered {

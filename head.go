@@ -52,6 +52,11 @@ var (
 	// writable time range.
 	ErrOutOfBounds = errors.New("out of bounds")
 
+	// ErrIndexClosed is returned when a write is attempted after the head
+	// index was closed. ErrHeadClosed is retained as a descriptive alias.
+	ErrIndexClosed = index.ErrClosed
+	ErrHeadClosed  = ErrIndexClosed
+
 	// emptyTombstoneReader is a no-op Tombstone Reader.
 	// This is used by head to satisfy the Tombstones() function call.
 	emptyTombstoneReader = newMemTombstones()
@@ -82,6 +87,15 @@ type Head struct {
 	deleted    map[uint64]int // Deleted series, and what WAL segment they must be kept until.
 
 	postings *index.MemPostings // postings lists for terms
+
+	// closeMu gates write transactions and Close. Writers hold it as readers
+	// for the duration of an individual append/commit operation; Close takes
+	// the write lock and therefore never closes the WAL or releases the index
+	// while an operation is in flight.
+	closeMu   sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type headMetrics struct {
@@ -731,6 +745,9 @@ func (a *initAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 	if a.app != nil {
 		return a.app.Add(lset, t, v)
 	}
+	if a.head.Closed() {
+		return 0, ErrHeadClosed
+	}
 	a.head.initTime(t)
 	a.app = a.head.appender()
 
@@ -739,6 +756,9 @@ func (a *initAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 
 func (a *initAppender) AddFast(ref uint64, t int64, v float64) error {
 	if a.app == nil {
+		if a.head.Closed() {
+			return ErrHeadClosed
+		}
 		return ErrNotFound
 	}
 	return a.app.AddFast(ref, t, v)
@@ -746,6 +766,10 @@ func (a *initAppender) AddFast(ref uint64, t int64, v float64) error {
 
 func (a *initAppender) Commit() error {
 	if a.app == nil {
+		a.head.metrics.activeAppenders.Dec()
+		if a.head.Closed() {
+			return ErrHeadClosed
+		}
 		return nil
 	}
 	return a.app.Commit()
@@ -753,6 +777,10 @@ func (a *initAppender) Commit() error {
 
 func (a *initAppender) Rollback() error {
 	if a.app == nil {
+		a.head.metrics.activeAppenders.Dec()
+		if a.head.Closed() {
+			return ErrHeadClosed
+		}
 		return nil
 	}
 	return a.app.Rollback()
@@ -824,13 +852,41 @@ type headAppender struct {
 	samples []RefSample
 }
 
+func (h *Head) beginWrite() (func(), error) {
+	h.closeMu.RLock()
+	if h.closed {
+		h.closeMu.RUnlock()
+		return nil, ErrHeadClosed
+	}
+	return h.closeMu.RUnlock, nil
+}
+
+// Closed reports whether Close has been called.
+func (h *Head) Closed() bool {
+	h.closeMu.RLock()
+	defer h.closeMu.RUnlock()
+	return h.closed
+}
+
 func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, error) {
+	end, err := a.head.beginWrite()
+	if err != nil {
+		return 0, err
+	}
+	defer end()
+
 	if t < a.minValidTime {
 		return 0, ErrOutOfBounds
 	}
 
-	// Ensure no empty labels have gotten through.
+	// Ensure no empty labels have gotten through. WithoutEmpty may return the
+	// caller's slice, so canonicalize its order before hashing. Equality and
+	// all inverted-index term construction treat a label set as ordered.
 	lset = lset.WithoutEmpty()
+	if !sort.IsSorted(lset) {
+		lset = append(labels.Labels(nil), lset...)
+		sort.Sort(lset)
+	}
 
 	s, created := a.head.getOrCreate(lset.Hash(), lset)
 	if created {
@@ -839,10 +895,29 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 			Labels: lset,
 		})
 	}
-	return s.ref, a.AddFast(s.ref, t, v)
+	if err := a.addFast(s.ref, t, v); err != nil {
+		if created {
+			s.Lock()
+			s.pendingCommit = false
+			s.Unlock()
+		}
+		return s.ref, err
+	}
+	return s.ref, nil
 }
 
 func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
+	end, err := a.head.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer end()
+
+	return a.addFast(ref, t, v)
+}
+
+// addFast requires the caller to hold a head write-operation lock.
+func (a *headAppender) addFast(ref uint64, t int64, v float64) error {
 	if t < a.minValidTime {
 		return ErrOutOfBounds
 	}
@@ -906,6 +981,14 @@ func (a *headAppender) log() error {
 }
 
 func (a *headAppender) Commit() error {
+	end, err := a.head.beginWrite()
+	if err != nil {
+		a.head.metrics.activeAppenders.Dec()
+		a.head.putAppendBuffer(a.samples)
+		return err
+	}
+	defer end()
+
 	defer a.head.metrics.activeAppenders.Dec()
 	defer a.head.putAppendBuffer(a.samples)
 
@@ -937,6 +1020,14 @@ func (a *headAppender) Commit() error {
 }
 
 func (a *headAppender) Rollback() error {
+	end, err := a.head.beginWrite()
+	if err != nil {
+		a.head.metrics.activeAppenders.Dec()
+		a.head.putAppendBuffer(a.samples)
+		return err
+	}
+	defer end()
+
 	a.head.metrics.activeAppenders.Dec()
 	for _, s := range a.samples {
 		s.series.Lock()
@@ -1069,8 +1160,8 @@ func (h *Head) gc() {
 	}
 
 	// Rebuild symbols and label value indices from what is left in the postings terms.
-	symbols := make(map[string]struct{}, len(h.symbols))
-	values := make(map[string]stringset, len(h.values))
+	symbols := make(map[string]struct{})
+	values := make(map[string]stringset)
 
 	if err := h.postings.Iter(func(t labels.Label, _ index.Postings) error {
 		symbols[t.Name] = struct{}{}
@@ -1102,6 +1193,9 @@ func (h *Head) Tombstones() (TombstoneReader, error) {
 }
 
 // Index returns an IndexReader against the block.
+//
+// Indexing remains readable after Close so callers can flush or compact a
+// sealed head. Close only rejects new writes.
 func (h *Head) Index() (IndexReader, error) {
 	return h.indexRange(math.MinInt64, math.MaxInt64), nil
 }
@@ -1110,7 +1204,12 @@ func (h *Head) indexRange(mint, maxt int64) *headIndexReader {
 	if hmin := h.MinTime(); hmin > mint {
 		mint = hmin
 	}
-	return &headIndexReader{head: h, mint: mint, maxt: maxt}
+	return &headIndexReader{
+		head:     h,
+		postings: h.postings,
+		mint:     mint,
+		maxt:     maxt,
+	}
 }
 
 // Chunks returns a ChunkReader against the block.
@@ -1128,6 +1227,43 @@ func (h *Head) chunksRange(mint, maxt int64) *headChunkReader {
 // NumSeries returns the number of active series in the head.
 func (h *Head) NumSeries() uint64 {
 	return atomic.LoadUint64(&h.numSeries)
+}
+
+// EstimatedMemoryBytes returns an approximate in-memory size of the active
+// head index, series labels and chunks. It is suitable for soft memory-pressure
+// cuts, not exact RSS accounting.
+func (h *Head) EstimatedMemoryBytes() int64 {
+	size := h.postings.Size()
+
+	h.symMtx.RLock()
+	for s := range h.symbols {
+		size += int64(len(s)) + 16
+	}
+	h.symMtx.RUnlock()
+
+	for i := 0; i < stripeSize; i++ {
+		h.series.locks[i].RLock()
+		for _, s := range h.series.hashes[i] {
+			for _, ms := range s {
+				size += 256 // memSeries, mutex, buffers and map-entry overhead estimate
+				for _, l := range ms.lset {
+					size += int64(len(l.Name)+len(l.Value)) + 32
+				}
+
+				ms.Lock()
+				for _, c := range ms.chunks {
+					size += 64 // memChunk/metadata overhead estimate
+					if c.chunk != nil {
+						b := c.chunk.Bytes()
+						size += int64(cap(b))
+					}
+				}
+				ms.Unlock()
+			}
+		}
+		h.series.locks[i].RUnlock()
+	}
+	return size
 }
 
 // Meta returns meta information about the head.
@@ -1162,12 +1298,21 @@ func (h *Head) compactable() bool {
 	return h.MaxTime()-h.MinTime() > h.chunkRange/2*3
 }
 
-// Close flushes the WAL and closes the head.
+// Close flushes and closes the WAL and marks the head closed to new writes.
+// The in-memory index remains available to readers and compaction until the
+// Head itself is garbage collected; this lets a caller safely flush a head
+// after stopping writers. Close is safe to call concurrently and repeatedly.
 func (h *Head) Close() error {
-	if h.wal == nil {
-		return nil
-	}
-	return h.wal.Close()
+	h.closeOnce.Do(func() {
+		h.closeMu.Lock()
+		h.closed = true
+		h.closeMu.Unlock()
+
+		if h.wal != nil {
+			h.closeErr = h.wal.Close()
+		}
+	})
+	return h.closeErr
 }
 
 type headChunkReader struct {
@@ -1220,6 +1365,7 @@ func (h *headChunkReader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 		Chunk: c.chunk,
 		s:     s,
 		cid:   int(cid),
+		mc:    c,
 	}, nil
 }
 
@@ -1227,18 +1373,27 @@ type safeChunk struct {
 	chunkenc.Chunk
 	s   *memSeries
 	cid int
+	mc  *memChunk
 }
 
 func (c *safeChunk) Iterator(reuseIter chunkenc.Iterator) chunkenc.Iterator {
 	c.s.Lock()
-	it := c.s.iterator(c.cid, reuseIter)
-	c.s.Unlock()
-	return it
+	defer c.s.Unlock()
+
+	// Once a chunk has been cut and is no longer the active head chunk, its
+	// compressed buffer is immutable. Iterate the pinned memChunk directly so
+	// a concurrent truncation/block cut cannot remap its numeric chunk ID.
+	if c.mc != nil && c.s.headChunk != c.mc {
+		return c.Chunk.Iterator(reuseIter)
+	}
+	return c.s.iterator(c.cid, reuseIter)
 }
 
 type headIndexReader struct {
-	head       *Head
-	mint, maxt int64
+	head     *Head
+	postings *index.MemPostings
+	mint     int64
+	maxt     int64
 }
 
 func (h *headIndexReader) Close() error {
@@ -1291,7 +1446,7 @@ func (h *headIndexReader) LabelNames() ([]string, error) {
 
 // Postings returns the postings list iterator for the label pair.
 func (h *headIndexReader) Postings(name, value string) (index.Postings, error) {
-	return h.head.postings.Get(name, value), nil
+	return h.postings.Get(name, value), nil
 }
 
 func (h *headIndexReader) SortedPostings(p index.Postings) index.Postings {
@@ -1348,11 +1503,21 @@ func (h *headIndexReader) Series(ref uint64, lbls *labels.Labels, chks *[]chunks
 			maxTime = math.MaxInt64
 		}
 
-		*chks = append(*chks, chunks.Meta{
+		meta := chunks.Meta{
 			MinTime: c.minTime,
 			MaxTime: maxTime,
 			Ref:     packChunkID(s.ref, uint64(s.chunkID(i))),
-		})
+			// Pin the chunk for an already-started query. A later cut or
+			// truncation may remove it from s.chunks, but the querier can
+			// continue through this reference.
+			Chunk: &safeChunk{
+				Chunk: c.chunk,
+				s:     s,
+				cid:   s.chunkID(i),
+				mc:    c,
+			},
+		}
+		*chks = append(*chks, meta)
 	}
 
 	return nil
@@ -1368,7 +1533,20 @@ func (h *headIndexReader) LabelIndices() ([][]string, error) {
 	return res, nil
 }
 
+func canonicalLabelSet(lset labels.Labels, hash uint64) (labels.Labels, uint64) {
+	if sort.IsSorted(lset) {
+		return lset, hash
+	}
+	// Equality and hashing are order-sensitive in this package. Callers are
+	// expected to pass sorted sets, but canonicalize direct/internal callers
+	// as well so the same label set cannot create two series.
+	lset = append(labels.Labels(nil), lset...)
+	sort.Sort(lset)
+	return lset, lset.Hash()
+}
+
 func (h *Head) getOrCreate(hash uint64, lset labels.Labels) (*memSeries, bool) {
+	lset, hash = canonicalLabelSet(lset, hash)
 	// Just using `getOrSet` below would be semantically sufficient, but we'd create
 	// a new series on every sample inserted via Add(), which causes allocations
 	// and makes our series IDs rather random and harder to compress in postings.
@@ -1384,18 +1562,35 @@ func (h *Head) getOrCreate(hash uint64, lset labels.Labels) (*memSeries, bool) {
 }
 
 func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSeries, bool) {
+	lset, hash = canonicalLabelSet(lset, hash)
 	s := newMemSeries(lset, id, h.chunkRange)
 
-	s, created := h.series.getOrSet(hash, s)
+	// Publish the ID lookup and inverted-index entry before publishing the
+	// label-set hash entry. GC discovers candidates through the hash map; if
+	// it removes a fully published series, the postings entry already exists
+	// and Delete can remove it. If another goroutine wins the label-set race,
+	// the speculative publications are rolled back below.
+	if prev, ok := h.series.setIDIfAbsent(s); ok {
+		return prev, false
+	}
+
+	h.postings.Add(id, lset)
+	h.addSymbols(lset)
+
+	prev, created := h.series.setHashIfAbsent(hash, s)
 	if !created {
-		return s, false
+		h.postings.Delete(map[uint64]struct{}{id: {}})
+		h.series.removeIDIfSame(s)
+		return prev, false
 	}
 
 	h.metrics.seriesCreated.Inc()
 	atomic.AddUint64(&h.numSeries, 1)
 
-	h.postings.Add(id, lset)
+	return s, true
+}
 
+func (h *Head) addSymbols(lset labels.Labels) {
 	h.symMtx.Lock()
 	defer h.symMtx.Unlock()
 
@@ -1410,8 +1605,6 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 		h.symbols[l.Name] = struct{}{}
 		h.symbols[l.Value] = struct{}{}
 	}
-
-	return s, true
 }
 
 // seriesHashmap is a simple hashmap for memSeries by their label set. It is built
@@ -1559,24 +1752,80 @@ func (s *stripeSeries) getByHash(hash uint64, lset labels.Labels) *memSeries {
 }
 
 func (s *stripeSeries) getOrSet(hash uint64, series *memSeries) (*memSeries, bool) {
+	// Publish the ID lookup first. Garbage collection discovers candidates
+	// through the label hash map, so an ID-only entry cannot be collected
+	// before the label set is published. Publishing the hash entry last makes
+	// a fully published series visible through both lookups in one step.
+	j := series.ref & stripeMask
+	s.locks[j].Lock()
+	if prev := s.series[j][series.ref]; prev != nil {
+		s.locks[j].Unlock()
+		return prev, false
+	}
+	s.series[j][series.ref] = series
+	s.locks[j].Unlock()
+
 	i := hash & stripeMask
 
 	s.locks[i].Lock()
 
 	if prev := s.hashes[i].get(hash, series.lset); prev != nil {
 		s.locks[i].Unlock()
+
+		// Remove the speculative ID entry. Only do this when it still points
+		// at the series inserted above.
+		s.locks[j].Lock()
+		if s.series[j][series.ref] == series {
+			delete(s.series[j], series.ref)
+		}
+		s.locks[j].Unlock()
+
 		return prev, false
 	}
 	s.hashes[i].set(hash, series)
 	s.locks[i].Unlock()
 
-	i = series.ref & stripeMask
-
-	s.locks[i].Lock()
-	s.series[i][series.ref] = series
-	s.locks[i].Unlock()
-
 	return series, true
+}
+
+// setIDIfAbsent publishes the series by its stable ID. A non-nil previous
+// series means the ID was already known.
+func (s *stripeSeries) setIDIfAbsent(series *memSeries) (*memSeries, bool) {
+	j := series.ref & stripeMask
+	s.locks[j].Lock()
+	defer s.locks[j].Unlock()
+
+	if prev := s.series[j][series.ref]; prev != nil {
+		return prev, true
+	}
+	s.series[j][series.ref] = series
+	return nil, false
+}
+
+// setHashIfAbsent publishes the series by its label set unless an equal label
+// set already exists.
+func (s *stripeSeries) setHashIfAbsent(hash uint64, series *memSeries) (*memSeries, bool) {
+	i := hash & stripeMask
+	s.locks[i].Lock()
+	defer s.locks[i].Unlock()
+
+	if prev := s.hashes[i].get(hash, series.lset); prev != nil {
+		return prev, false
+	}
+	s.hashes[i].set(hash, series)
+	return series, true
+}
+
+// removeIDIfSame removes a speculative ID publication only when it still points
+// at the supplied series.
+func (s *stripeSeries) removeIDIfSame(series *memSeries) {
+	j := series.ref & stripeMask
+	s.locks[j].Lock()
+	defer s.locks[j].Unlock()
+
+	if s.series[j][series.ref] == series {
+		delete(s.series[j], series.ref)
+	}
 }
 
 type sample struct {

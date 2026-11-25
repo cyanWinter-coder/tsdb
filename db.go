@@ -72,6 +72,12 @@ type Options struct {
 	// the current size of the database.
 	MaxBytes int64
 
+	// MemoryLimitBytes is an optional soft budget for the in-memory head
+	// index and chunks. When positive, the background loop periodically
+	// estimates head memory and persists/cuts a time-bounded head range once
+	// the estimate exceeds this value. Zero disables memory-pressure cuts.
+	MemoryLimitBytes int64
+
 	// The sizes of the Blocks.
 	BlockRanges []int64
 
@@ -143,6 +149,9 @@ type DB struct {
 
 	// Cancel a running compaction when a shutdown is initiated.
 	compactCancel context.CancelFunc
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type dbMetrics struct {
@@ -539,6 +548,13 @@ func (db *DB) run() {
 
 	backoff := time.Duration(0)
 
+	var memoryTickC <-chan time.Time
+	if db.opts != nil && db.opts.MemoryLimitBytes > 0 {
+		memoryTicker := time.NewTicker(10 * time.Second)
+		defer memoryTicker.Stop()
+		memoryTickC = memoryTicker.C
+	}
+
 	for {
 		select {
 		case <-db.stopc:
@@ -547,6 +563,15 @@ func (db *DB) run() {
 		}
 
 		select {
+		case <-memoryTickC:
+			db.autoCompactMtx.Lock()
+			auto := db.autoCompact
+			db.autoCompactMtx.Unlock()
+			if auto {
+				if _, err := db.CutHeadIfMemoryExceeded(db.opts.MemoryLimitBytes); err != nil {
+					level.Error(db.logger).Log("msg", "memory-pressure head cut failed", "err", err)
+				}
+			}
 		case <-time.After(1 * time.Minute):
 			select {
 			case db.compactc <- struct{}{}:
@@ -606,7 +631,13 @@ func (a dbAppender) Commit() error {
 // this is sufficient to reliably delete old data.
 // Old blocks are only deleted on reload based on the new block's parent information.
 // See DB.reload documentation for further information.
-func (db *DB) compact() (err error) {
+func (db *DB) compact() error {
+	return db.compactHead(false)
+}
+
+// compactHead persists the ready head range. When force is true it also cuts a
+// still-open time range, which is used for memory-pressure rotation.
+func (db *DB) compactHead(force bool) (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 	defer func() {
@@ -622,12 +653,23 @@ func (db *DB) compact() (err error) {
 			return nil
 		default:
 		}
-		if !db.head.compactable() {
+		compactable := db.head.compactable()
+		if !compactable && !force {
+			break
+		}
+		if force && db.head.NumSeries() == 0 {
 			break
 		}
 		mint := db.head.MinTime()
-		maxt := rangeForTimestamp(mint, db.head.chunkRange)
+		var maxt int64
+		if compactable {
+			maxt = rangeForTimestamp(mint, db.head.chunkRange)
+		} else {
+			maxt = db.head.MaxTime() + 1
+		}
 
+		// Do not repeatedly force-cut an empty head.
+		force = false
 		// Wrap head into a range that bounds all reads to it.
 		head := &rangeHead{
 			head: db.head,
@@ -1058,10 +1100,31 @@ func (db *DB) Head() *Head {
 	return db.head
 }
 
-// Close the partition.
+// Closed reports whether the database has started shutdown.
+func (db *DB) Closed() bool {
+	if db.stopc == nil {
+		return false
+	}
+	select {
+	case <-db.stopc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close the partition. It is idempotent: concurrent and repeated calls run
+// the shutdown sequence once and return the same result.
 func (db *DB) Close() error {
+	db.closeOnce.Do(db.close)
+	return db.closeErr
+}
+
+func (db *DB) close() {
 	close(db.stopc)
-	db.compactCancel()
+	if db.compactCancel != nil {
+		db.compactCancel()
+	}
 	<-db.donec
 
 	db.mtx.Lock()
@@ -1082,7 +1145,33 @@ func (db *DB) Close() error {
 		merr.Add(db.lockf.Release())
 	}
 	merr.Add(db.head.Close())
-	return merr.Err()
+	// The DB is terminal. Closing the MemPostings releases its maps and
+	// makes any later accidental index use observe ErrClosed.
+	if db.head.postings != nil {
+		merr.Add(db.head.postings.Close())
+	}
+	db.closeErr = merr.Err()
+}
+
+// Compact runs one head-persist and block-compaction cycle. It is safe to
+// call while appenders are active: new samples continue into the head while a
+// bounded range is persisted.
+func (db *DB) Compact() error {
+	return db.compact()
+}
+
+// CutHeadIfMemoryExceeded performs a time-bounded head cut when the estimated
+// head index/chunk memory exceeds maxBytes. The cut runs through the normal
+// compaction path and takes only the compaction mutex; appenders are not
+// serialized against block persistence.
+func (db *DB) CutHeadIfMemoryExceeded(maxBytes int64) (cut bool, err error) {
+	if maxBytes <= 0 || db.head.EstimatedMemoryBytes() <= maxBytes {
+		return false, nil
+	}
+	if err := db.compactHead(true); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // DisableCompactions disables auto compactions.

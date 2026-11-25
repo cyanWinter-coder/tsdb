@@ -798,7 +798,9 @@ func (s *populatedChunkSeries) Next() bool {
 				break
 			}
 
-			c.Chunk, s.err = s.chunks.Chunk(c.Ref)
+			if c.Chunk == nil {
+				c.Chunk, s.err = s.chunks.Chunk(c.Ref)
+			}
 			if s.err != nil {
 				// This means that the chunk has be garbage collected. Remove it from the list.
 				if s.err == ErrNotFound {
